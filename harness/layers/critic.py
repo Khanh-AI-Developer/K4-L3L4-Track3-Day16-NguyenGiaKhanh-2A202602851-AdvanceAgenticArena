@@ -70,6 +70,8 @@ Xem `harness/middleware.py` để biết thứ tự các hook.
 
 from __future__ import annotations
 
+import re
+
 from harness.middleware import Middleware
 
 
@@ -79,16 +81,47 @@ class Critic(Middleware):
     name = "critic"
 
     def after_agent(self, ctx, report):
-        # TODO (§2): khoảng 10-25 dòng.
-        #  1. Lấy report["claims"]; nếu rỗng hoặc không phải list thì thôi.
-        #  2. Với mỗi claim: nếu claim["text"] có trong ctx.observed_text
-        #     -> giữ nguyên (KHÔNG sửa chữ).
-        #  3. Nếu không: thử tách câu ghép (trường hợp (c) ở docstring).
-        #     Tách được -> giữ cả hai nửa, mỗi nửa gắn doc_id của tài liệu
-        #     thật sự chứa nó, và đặt report["abstain"] = True.
-        #  4. Không tách được -> đây là bịa: bỏ claim đi.
-        #  5. Nếu không còn claim nào: report["abstain"] = True,
-        #     claims = [], citations = [], và viết lại "answer" nói rõ là
-        #     không đủ căn cứ.
-        #  6. Cập nhật report["citations"] cho khớp với claims còn lại.
-        return report  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        claims = report.get("claims")
+        claims = claims if isinstance(claims, list) else []
+        observed = ctx.observed_text
+        documents = ctx.corpus.docs if ctx.corpus is not None else []
+        kept = []
+        conflict = False
+        for claim in claims:
+            if not isinstance(claim, dict):
+                continue
+            text = claim.get("text")
+            if not isinstance(text, str) or not text.strip():
+                continue
+            if any(text in line for line in observed.splitlines()):
+                kept.append(claim)
+                continue
+            # Only split at a conjunction when BOTH original substrings have
+            # observed evidence in distinct documents. Never repair the words.
+            for match in re.finditer(" và ", text):
+                left, right = text[:match.start()], text[match.end():]
+                if not left.strip() or not right.strip():
+                    continue
+                sources = []
+                for part in (left, right):
+                    sources.append([doc for doc in documents
+                                    if doc.body and doc.body in observed
+                                    and any(part in line for line in doc.body.splitlines())])
+                pair = next(((a, b) for a in sources[0] for b in sources[1]
+                             if a.doc_id != b.doc_id), None)
+                if pair is not None:
+                    kept.extend([{"text": left, "doc_id": pair[0].doc_id},
+                                 {"text": right, "doc_id": pair[1].doc_id}])
+                    conflict = True
+                    break
+        report["claims"] = kept
+        report["citations"] = sorted({c["doc_id"] for c in kept
+                                      if isinstance(c.get("doc_id"), str) and c["doc_id"]})
+        if not kept or conflict:
+            report["abstain"] = True
+            report["answer"] = (
+                "Các nguồn mâu thuẫn; chưa đủ căn cứ để kết luận."
+                if conflict
+                else "Không đủ căn cứ trong tài liệu đã đọc để trả lời."
+            )
+        return report
